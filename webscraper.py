@@ -34,7 +34,7 @@ class ScrapedItem:
 
 
 class WebScraper:
-    def __init__(self, base_url: str, max_pages: int = 100, delay: float = 1.0):
+    def __init__(self, base_url: str, max_pages: int = 100, delay: float = 2.0):
         self.base_url = base_url
         self.domain = urlparse(base_url).netloc
         self.max_pages = max_pages
@@ -46,6 +46,8 @@ class WebScraper:
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         })
         self.driver = None
+        self.request_count = 0
+        self.last_request_time = 0
         
     def __enter__(self):
         return self
@@ -87,6 +89,142 @@ class WebScraper:
         parsed = urlparse(url)
         return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
     
+    def should_filter_url(self, url: str) -> bool:
+        """Check if URL should be filtered out (images, shop, etc.)"""
+        url_lower = url.lower()
+        
+        # Filter out image URLs
+        image_extensions = ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.svg', '.webp', '.ico', '.tiff']
+        if any(url_lower.endswith(ext) for ext in image_extensions):
+            return True
+        
+        # Filter out shop/ecommerce URLs
+        shop_keywords = ['/shop', '/store', '/cart', '/checkout', '/product', '/products', 
+                        '/buy', '/purchase', '/order', '/billing', '/payment', '/account',
+                        '/profile', '/settings', '/admin', '/dashboard', '/login', '/signup',
+                        '/register', '/logout', '/search', '/filter', '/category', '/categories']
+        if any(keyword in url_lower for keyword in shop_keywords):
+            return True
+        
+        # Filter out comment-related URLs
+        comment_keywords = ['/comments', '/comment', '/discuss', '/discussion', '/replies',
+                           '/reply', '/thread', '/threads', '/forum', '/forums', '/chat',
+                           '/live-chat', '/support', '/help', '/faq', '/contact']
+        if any(keyword in url_lower for keyword in comment_keywords):
+            return True
+        
+        # Filter out social media and external links
+        social_domains = ['facebook.com', 'twitter.com', 'instagram.com', 'linkedin.com', 
+                         'youtube.com', 'tiktok.com', 'pinterest.com', 'snapchat.com']
+        if any(domain in url_lower for domain in social_domains):
+            return True
+        
+        # Filter out file downloads
+        file_extensions = ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', 
+                          '.zip', '.rar', '.tar', '.gz', '.mp3', '.mp4', '.avi', '.mov']
+        if any(url_lower.endswith(ext) for ext in file_extensions):
+            return True
+        
+        # Filter out API endpoints and technical URLs
+        api_keywords = ['/api/', '/ajax/', '/json/', '/xml/', '/rss/', '/feed/', 
+                       '/sitemap', '/robots.txt', '/favicon.ico', '/.well-known/']
+        if any(keyword in url_lower for keyword in api_keywords):
+            return True
+        
+        # Filter out URLs with query parameters that suggest dynamic/filtered content
+        parsed = urlparse(url)
+        if parsed.query:
+            query_params = parse_qs(parsed.query)
+            # Filter out URLs with pagination, sorting, filtering parameters
+            filter_params = ['page', 'p', 'offset', 'limit', 'sort', 'order', 'filter', 
+                           'search', 'q', 'category', 'tag', 'date', 'year', 'month']
+            if any(param in query_params for param in filter_params):
+                return True
+        
+        return False
+    
+    def smart_delay(self):
+        """Implement smart rate limiting to avoid hitting rate limits"""
+        current_time = time.time()
+        
+        # If this is not the first request, ensure minimum delay
+        if self.last_request_time > 0:
+            time_since_last = current_time - self.last_request_time
+            if time_since_last < self.delay:
+                sleep_time = self.delay - time_since_last
+                print(f"Rate limiting: waiting {sleep_time:.1f}s to avoid hitting rate limits...")
+                time.sleep(sleep_time)
+        
+        # Increase delay after every 10 requests to be more conservative
+        if self.request_count > 0 and self.request_count % 10 == 0:
+            self.delay = min(self.delay * 1.2, 5.0)  # Cap at 5 seconds
+            print(f"Increased delay to {self.delay:.1f}s after {self.request_count} requests")
+        
+        self.last_request_time = time.time()
+        self.request_count += 1
+    
+    def handle_rate_limit(self, url: str, retry_count: int = 0) -> bool:
+        """Handle rate limiting with exponential backoff"""
+        if retry_count >= 3:
+            print(f"Max retries reached for {url}, skipping...")
+            return False
+        
+        # Exponential backoff: 2^retry_count * base_delay
+        backoff_delay = (2 ** retry_count) * self.delay
+        print(f"Rate limit hit for {url}, waiting {backoff_delay:.1f}s before retry {retry_count + 1}/3...")
+        time.sleep(backoff_delay)
+        return True
+    
+    def is_error_page(self, content: str) -> bool:
+        """Check if the page content indicates an error or rate limit"""
+        if not content:
+            return True
+        
+        error_indicators = [
+            "Too Many Requests",
+            "Rate limit exceeded",
+            "429 Too Many Requests",
+            "Service temporarily unavailable",
+            "Please try again later",
+            "Access denied",
+            "Forbidden",
+            "Page not found",
+            "404 Not Found",
+            "This site requires JavaScript"
+        ]
+        
+        content_lower = content.lower().strip()
+        return any(indicator.lower() in content_lower for indicator in error_indicators)
+    
+    def clean_comment_content(self, content: str) -> str:
+        """Remove comment-related content from text"""
+        if not content:
+            return content
+        
+        # Common comment patterns to remove
+        comment_patterns = [
+            r'Comments?\s*\(\d+\)',  # "Comments (5)"
+            r'Leave a comment',  # "Leave a comment"
+            r'Add a comment',  # "Add a comment"
+            r'Post a comment',  # "Post a comment"
+            r'Reply to this',  # "Reply to this"
+            r'Join the discussion',  # "Join the discussion"
+            r'What do you think\?',  # "What do you think?"
+            r'Share your thoughts',  # "Share your thoughts"
+            r'Tell us what you think',  # "Tell us what you think"
+            r'Comment below',  # "Comment below"
+            r'Comments are closed',  # "Comments are closed"
+            r'Discussion\s*\(\d+\)',  # "Discussion (3)"
+            r'Replies?\s*\(\d+\)',  # "Replies (2)"
+            r'Thread\s*\(\d+\)',  # "Thread (1)"
+        ]
+        
+        cleaned_content = content
+        for pattern in comment_patterns:
+            cleaned_content = re.sub(pattern, '', cleaned_content, flags=re.IGNORECASE)
+        
+        return cleaned_content.strip()
+    
     def extract_links_from_html(self, html: str, base_url: str) -> List[str]:
         """Extract all links from HTML content"""
         soup = BeautifulSoup(html, 'html.parser')
@@ -96,8 +234,8 @@ class WebScraper:
             href = link['href']
             full_url = urljoin(base_url, href)
             
-            # Only include same-domain links
-            if self.is_same_domain(full_url):
+            # Only include same-domain links that pass filtering
+            if self.is_same_domain(full_url) and not self.should_filter_url(full_url):
                 clean_url = self.clean_url(full_url)
                 if clean_url not in self.visited_urls:
                     links.append(clean_url)
@@ -124,7 +262,7 @@ class WebScraper:
                     href = element.get_attribute('href')
                     if href:
                         full_url = urljoin(url, href)
-                        if self.is_same_domain(full_url):
+                        if self.is_same_domain(full_url) and not self.should_filter_url(full_url):
                             clean_url = self.clean_url(full_url)
                             if clean_url not in self.visited_urls:
                                 links.append(clean_url)
@@ -173,9 +311,29 @@ class WebScraper:
         """Extract content from HTML using BeautifulSoup"""
         soup = BeautifulSoup(html, 'html.parser')
         
-        # Remove script and style elements
-        for script in soup(["script", "style", "nav", "footer", "header"]):
-            script.decompose()
+        # Remove script, style, and comment-related elements
+        elements_to_remove = [
+            "script", "style", "nav", "footer", "header",
+            # Comment-related elements
+            ".comments", ".comment", ".comment-section", ".comment-list",
+            ".discussion", ".discuss", ".replies", ".reply", ".thread",
+            ".forum", ".chat", ".live-chat", ".support", ".help", ".faq",
+            # Common comment system selectors
+            "[id*='comment']", "[class*='comment']", "[id*='discuss']",
+            "[class*='discuss']", "[id*='reply']", "[class*='reply']",
+            "[id*='thread']", "[class*='thread']", "[id*='forum']",
+            "[class*='forum']", "[id*='chat']", "[class*='chat']"
+        ]
+        
+        for selector in elements_to_remove:
+            if selector.startswith('['):
+                # Handle attribute selectors
+                for element in soup.select(selector):
+                    element.decompose()
+            else:
+                # Handle class and tag selectors
+                for element in soup(selector):
+                    element.decompose()
         
         # Try to find title
         title = ""
@@ -210,6 +368,12 @@ class WebScraper:
         
         # Clean up content
         content = re.sub(r'\s+', ' ', content).strip()
+        content = self.clean_comment_content(content)
+        
+        # Skip error pages
+        if self.is_error_page(content):
+            print(f"Skipping error page: {url}")
+            return None
         
         # For blog listing pages, try to extract individual blog post information
         if '/blog' in url and not url.endswith('/blog'):
@@ -342,13 +506,36 @@ class WebScraper:
             return None
         
         try:
+            self.smart_delay()  # Apply rate limiting for Selenium too
             self.driver.get(url)
-            WebDriverWait(self.driver, 10).until(
+            WebDriverWait(self.driver, 15).until(
                 EC.presence_of_element_located((By.TAG_NAME, "body"))
             )
             
             # Wait a bit for dynamic content to load
             time.sleep(2)
+            
+            # Remove comment sections before extracting content
+            try:
+                comment_selectors = [
+                    ".comments", ".comment", ".comment-section", ".comment-list",
+                    ".discussion", ".discuss", ".replies", ".reply", ".thread",
+                    ".forum", ".chat", ".live-chat", ".support", ".help", ".faq",
+                    "[id*='comment']", "[class*='comment']", "[id*='discuss']",
+                    "[class*='discuss']", "[id*='reply']", "[class*='reply']",
+                    "[id*='thread']", "[class*='thread']", "[id*='forum']",
+                    "[class*='forum']", "[id*='chat']", "[class*='chat']"
+                ]
+                
+                for selector in comment_selectors:
+                    try:
+                        elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                        for element in elements:
+                            self.driver.execute_script("arguments[0].remove();", element)
+                    except:
+                        continue
+            except:
+                pass  # Continue even if comment removal fails
             
             # Get title
             title = self.driver.title.strip()
@@ -378,6 +565,12 @@ class WebScraper:
             
             # Clean up content
             content = re.sub(r'\s+', ' ', content).strip()
+            content = self.clean_comment_content(content)
+            
+            # Skip error pages
+            if self.is_error_page(content):
+                print(f"Skipping error page: {url}")
+                return None
             
             if not title and not content:
                 return None
@@ -398,28 +591,93 @@ class WebScraper:
             print(f"Error extracting content with Selenium from {url}: {e}")
             return None
     
+    def needs_javascript(self, url: str, html_content: str = None) -> bool:
+        """Check if a page likely needs JavaScript to render properly"""
+        if html_content:
+            # Check for common JavaScript-heavy indicators
+            js_indicators = [
+                'This site requires JavaScript',
+                'Please enable JavaScript',
+                'JavaScript is disabled',
+                'React', 'Vue', 'Angular', 'Next.js', 'Nuxt',
+                'substack.com', 'medium.com', 'hashnode.dev',
+                'data-react', 'data-vue', 'ng-app'
+            ]
+            return any(indicator in html_content for indicator in js_indicators)
+        
+        # Check URL patterns that typically need JavaScript
+        js_url_patterns = [
+            'substack.com', 'medium.com', 'hashnode.dev', 'dev.to',
+            'notion.so', 'airtable.com', 'typeform.com'
+        ]
+        return any(pattern in url.lower() for pattern in js_url_patterns)
+
     def scrape_page(self, url: str) -> Tuple[List[ScrapedItem], List[str]]:
         """Scrape a single page and return content + discovered links"""
         print(f"Scraping: {url}")
         
-        # For blog listing pages, try Selenium first as they're often dynamic
-        if '/blog' in url and (url.endswith('/blog') or '/blog/' in url):
+        # Check if this URL likely needs JavaScript
+        needs_js = self.needs_javascript(url)
+        
+        # For JavaScript-heavy sites or blog pages, try Selenium first
+        if needs_js or '/blog' in url and (url.endswith('/blog') or '/blog/' in url):
             if not self.driver:
                 self.setup_selenium()
             
             if self.driver:
                 try:
-                    blog_posts = self.extract_blog_posts_with_selenium(url)
-                    links = self.extract_links_with_selenium(url)
-                    if blog_posts:
-                        return blog_posts, links
+                    if '/blog' in url and (url.endswith('/blog') or '/blog/' in url):
+                        blog_posts = self.extract_blog_posts_with_selenium(url)
+                        links = self.extract_links_with_selenium(url)
+                        if blog_posts:
+                            return blog_posts, links
+                    else:
+                        item = self.extract_content_with_selenium(url)
+                        links = self.extract_links_with_selenium(url)
+                        if item:
+                            return [item], links
                 except Exception as e:
                     print(f"Selenium scraping failed for {url}: {e}")
         
-        # Try HTML parsing
+        # Try HTML parsing with rate limiting
         try:
-            response = self.session.get(url, timeout=10)
+            self.smart_delay()  # Apply rate limiting before each request
+            
+            response = self.session.get(url, timeout=15)
+            
+            # Handle rate limiting responses
+            if response.status_code == 429:  # Too Many Requests
+                print(f"Rate limit hit for {url} (429), implementing backoff...")
+                if self.handle_rate_limit(url):
+                    # Retry the request
+                    self.smart_delay()
+                    response = self.session.get(url, timeout=15)
+                    response.raise_for_status()
+                else:
+                    return [], []
+            elif response.status_code == 403:  # Forbidden
+                print(f"Access forbidden for {url} (403), skipping...")
+                return [], []
+            elif response.status_code >= 400:
+                print(f"HTTP error {response.status_code} for {url}, skipping...")
+                return [], []
+            
             response.raise_for_status()
+            
+            # Check if the HTML content indicates JavaScript is needed
+            if self.needs_javascript(url, response.text):
+                print(f"Detected JavaScript requirement for {url}, switching to Selenium")
+                if not self.driver:
+                    self.setup_selenium()
+                
+                if self.driver:
+                    try:
+                        item = self.extract_content_with_selenium(url)
+                        links = self.extract_links_with_selenium(url)
+                        if item:
+                            return [item], links
+                    except Exception as e:
+                        print(f"Selenium scraping failed for {url}: {e}")
             
             # Extract content
             result = self.extract_content_from_html(response.text, url)
@@ -433,6 +691,9 @@ class WebScraper:
             elif result and len(result.content) > 50:
                 return [result], links
             
+        except requests.exceptions.RequestException as e:
+            print(f"Request failed for {url}: {e}")
+            return [], []
         except Exception as e:
             print(f"HTML parsing failed for {url}: {e}")
         
@@ -473,13 +734,14 @@ class WebScraper:
                 self.scraped_items.append(item)
                 print(f"✓ Scraped: {item.title} ({item.content_type})")
             
-            # Add new links to visit
+            # Add new links to visit (with additional filtering)
             for link in new_links:
-                if link not in self.visited_urls and len(urls_to_visit) < self.max_pages * 2:
+                if (link not in self.visited_urls and 
+                    not self.should_filter_url(link) and 
+                    len(urls_to_visit) < self.max_pages * 2):
                     urls_to_visit.append(link)
             
-            # Delay between requests
-            time.sleep(self.delay)
+            # Smart delay is now handled in scrape_page method
         
         print(f"Scraping complete. Found {len(self.scraped_items)} items.")
         
