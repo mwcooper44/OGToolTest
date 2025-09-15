@@ -1,3 +1,11 @@
+# Try to import gevent, but don't fail if it's not available
+try:
+    from gevent import monkey
+    monkey.patch_all()
+    print("✅ Gevent monkey patching enabled")
+except ImportError:
+    print("⚠️  Gevent not available, using default async mode")
+
 from flask import Flask, render_template, request, jsonify, send_file
 from flask_socketio import SocketIO, emit
 import threading
@@ -10,7 +18,17 @@ import io
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'your-secret-key-here'
-socketio = SocketIO(app, cors_allowed_origins="*", ping_timeout=60, ping_interval=25)
+
+# Try to use gevent if available, otherwise use threading
+try:
+    import gevent
+    async_mode = 'gevent'
+    print("✅ Using gevent async mode")
+except ImportError:
+    async_mode = 'threading'
+    print("⚠️  Using threading async mode (gevent not available)")
+
+socketio = SocketIO(app, async_mode=async_mode, cors_allowed_origins="*", ping_timeout=60, ping_interval=25)
 
 # Global variables to track scraping status
 scraping_status = {
@@ -27,7 +45,7 @@ class ConsoleOutput:
     """Custom console output handler that sends updates via WebSocket"""
     def __init__(self):
         self.output_lines = []
-        self.max_lines = 10
+        self.max_lines = 100  # Increased from 10 to 100 for scrollable console
     
     def write(self, message):
         """Write message to console and emit via WebSocket"""
@@ -37,14 +55,15 @@ class ConsoleOutput:
             
             self.output_lines.append(formatted_message)
             
-            # Keep only last 10 lines
+            # Keep only last 100 lines
             if len(self.output_lines) > self.max_lines:
                 self.output_lines.pop(0)
             
-            # Emit to all connected clients
+            # Emit real-time update to all connected clients
             socketio.emit('console_update', {
                 'message': formatted_message,
-                'lines': self.output_lines.copy()
+                'lines': self.output_lines.copy(),
+                'is_realtime': True
             })
     
     def flush(self):
@@ -59,18 +78,20 @@ sys.stdout = console_output
 def index():
     return render_template('index.html')
 
-@app.route('/api/start_scraping', methods=['POST'])
-def start_scraping():
+@socketio.on('start_scraping')
+def handle_start_scraping(data):
+    """Handle scraping request via WebSocket"""
     global scraping_status
+    sid = request.sid
     
     if scraping_status['is_running']:
-        return jsonify({'error': 'Scraping is already in progress'}), 400
+        emit('error', {'message': 'Scraping is already in progress'})
+        return
     
-    data = request.get_json()
     url = data.get('url', '').strip()
-    
     if not url:
-        return jsonify({'error': 'URL is required'}), 400
+        emit('error', {'message': 'URL is required'})
+        return
     
     # Validate URL
     if not url.startswith(('http://', 'https://')):
@@ -87,12 +108,9 @@ def start_scraping():
         'cancelled': False
     })
     
-    # Start scraping in a separate thread
-    thread = threading.Thread(target=run_scraper, args=(url,))
-    thread.daemon = True
-    thread.start()
-    
-    return jsonify({'message': 'Scraping started', 'url': url})
+    # Start scraping in background task
+    socketio.start_background_task(run_scraper_background, sid, url)
+    emit('scraping_started', {'message': 'Scraping started', 'url': url})
 
 @app.route('/api/status')
 def get_status():
@@ -136,107 +154,99 @@ def download_results():
         download_name=download_name
     )
 
-def run_scraper(url):
-    """Run the web scraper in a separate thread"""
+def run_scraper_background(sid, url):
+    """Run the web scraper in a background task with real-time WebSocket updates"""
     global scraping_status
     
-    try:
-        print(f"🚀 Starting to scrape: {url}")
-        
-        # Create scraper instance
-        scraper = WebScraper(url, max_pages=50, delay=2.0)
-        
-        # Set up cancellation checking
-        def check_cancellation():
-            return scraping_status.get('cancelled', False)
-        
-        scraper.check_cancellation = check_cancellation
-        
-        # Start heartbeat thread to keep connection alive
-        heartbeat_thread = threading.Thread(target=send_heartbeat)
-        heartbeat_thread.daemon = True
-        heartbeat_thread.start()
-        
-        # Override the scraper's print function to use our console output
-        original_print = print
-        def custom_print(*args, **kwargs):
-            message = ' '.join(str(arg) for arg in args)
-            console_output.write(message)
-            console_output.write('\n')
+    with app.app_context():
+        try:
+            # Emit start message
+            socketio.emit('log_message', {'data': f"🚀 Starting to scrape: {url}"}, to=sid)
             
-            # Add to console output list and emit to frontend
-            scraping_status['console_output'].append(message)
-            if len(scraping_status['console_output']) > 10:
-                scraping_status['console_output'] = scraping_status['console_output'][-10:]
+            # Create scraper instance
+            scraper = WebScraper(url, max_pages=50, delay=2.0)
             
-            # Emit console update to frontend
-            socketio.emit('console_update', {
-                'lines': scraping_status['console_output']
+            # Set up cancellation checking
+            def check_cancellation():
+                return scraping_status.get('cancelled', False)
+            
+            scraper.check_cancellation = check_cancellation
+            
+            # Override the scraper's print function to emit real-time messages
+            original_print = print
+            def custom_print(*args, **kwargs):
+                message = ' '.join(str(arg) for arg in args)
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                formatted_message = f"[{timestamp}] {message.strip()}"
+                
+                # Emit immediately to the specific client
+                socketio.emit('log_message', {'data': formatted_message}, to=sid)
+            
+            # Temporarily replace print
+            import builtins
+            builtins.print = custom_print
+            
+            # Run the scraper with cancellation check
+            results = scraper.scrape_website()
+            
+            # Check if scraping was cancelled
+            if scraping_status.get('cancelled', False):
+                socketio.emit('log_message', {'data': "🛑 Scraping was cancelled by user"}, to=sid)
+                return
+            
+            # Restore original print
+            builtins.print = original_print
+            
+            # Save results to file
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            domain = url.replace('https://', '').replace('http://', '').split('/')[0]
+            filename = f"{domain}_{timestamp}.json"
+            filepath = os.path.join('scraped_results', filename)
+            
+            # Create directory if it doesn't exist
+            os.makedirs('scraped_results', exist_ok=True)
+            
+            # Save results
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(results, f, indent=2, ensure_ascii=False)
+            
+            # Update status
+            scraping_status.update({
+                'is_running': False,
+                'progress': 100,
+                'results_file': filepath,
+                'total_pages': len(results.get('items', []))
             })
-        
-        # Temporarily replace print
-        import builtins
-        builtins.print = custom_print
-        
-        # Run the scraper with cancellation check
-        results = scraper.scrape_website()
-        
-        # Check if scraping was cancelled
-        if scraping_status.get('cancelled', False):
-            print("🛑 Scraping was cancelled by user")
-            return
-        
-        # Restore original print
-        builtins.print = original_print
-        
-        # Save results to file
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        domain = url.replace('https://', '').replace('http://', '').split('/')[0]
-        filename = f"{domain}_{timestamp}.json"
-        filepath = os.path.join('scraped_results', filename)
-        
-        # Create directory if it doesn't exist
-        os.makedirs('scraped_results', exist_ok=True)
-        
-        # Save results
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
-        
-        # Update status
-        scraping_status.update({
-            'is_running': False,
-            'progress': 100,
-            'results_file': filepath,
-            'total_pages': len(results.get('items', []))
-        })
-        
-        print(f"✅ Scraping completed! Found {len(results.get('items', []))} items")
-        print(f"📁 Results saved to: {filename}")
-        print("🎉 Ready for download!")
-        
-        # Emit completion event
-        socketio.emit('scraping_complete', {
-            'total_items': len(results.get('items', [])),
-            'filename': filename
-        })
-        
-    except Exception as e:
-        # Restore original print
-        import builtins
-        builtins.print = original_print
-        
-        print(f"❌ Error during scraping: {str(e)}")
-        
-        # Update status
-        scraping_status.update({
-            'is_running': False,
-            'progress': 0
-        })
-        
-        # Emit error event
-        socketio.emit('scraping_error', {
-            'error': str(e)
-        })
+            
+            # Emit completion messages
+            socketio.emit('log_message', {'data': f"✅ Scraping completed! Found {len(results.get('items', []))} items"}, to=sid)
+            socketio.emit('log_message', {'data': f"📁 Results saved to: {filename}"}, to=sid)
+            socketio.emit('log_message', {'data': "🎉 Ready for download!"}, to=sid)
+            
+            # Emit completion event
+            socketio.emit('scraping_complete', {
+                'total_items': len(results.get('items', [])),
+                'filename': filename
+            }, to=sid)
+            
+        except Exception as e:
+            # Restore original print
+            import builtins
+            builtins.print = original_print
+            
+            # Emit error message
+            socketio.emit('log_message', {'data': f"❌ Error during scraping: {str(e)}"}, to=sid)
+            
+            # Update status
+            scraping_status.update({
+                'is_running': False,
+                'progress': 0
+            })
+            
+            # Emit error event
+            socketio.emit('scraping_error', {
+                'error': str(e)
+            }, to=sid)
 
 def send_heartbeat():
     """Send periodic heartbeat to keep WebSocket connection alive"""
@@ -261,6 +271,12 @@ def handle_disconnect():
 def handle_heartbeat_response():
     """Handle heartbeat response from client"""
     pass
+
+@socketio.on('test')
+def handle_test(data):
+    """Handle test message from client"""
+    print(f"Received test message: {data}")
+    socketio.emit('test_response', {'message': 'Test successful!'})
 
 if __name__ == '__main__':
     # Create scraped_results directory

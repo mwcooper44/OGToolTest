@@ -88,7 +88,25 @@ class WebScraper:
             chrome_options.add_argument('--window-size=1920,1080')
             chrome_options.add_argument('--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36')
             
-            service = Service(ChromeDriverManager().install())
+            # Get the ChromeDriver path and ensure it points to the correct binary
+            driver_path = ChromeDriverManager().install()
+            
+            # Fix the path if it's pointing to the wrong file
+            if 'THIRD_PARTY_NOTICES.chromedriver' in driver_path:
+                # Replace the wrong filename with the correct one
+                driver_path = driver_path.replace('THIRD_PARTY_NOTICES.chromedriver', 'chromedriver')
+            
+            # Verify the driver exists and is executable
+            import os
+            if not os.path.exists(driver_path):
+                print(f"ChromeDriver not found at {driver_path}")
+                return False
+            
+            if not os.access(driver_path, os.X_OK):
+                print(f"ChromeDriver not executable at {driver_path}")
+                return False
+            
+            service = Service(driver_path)
             self.driver = webdriver.Chrome(service=service, options=chrome_options)
             self.driver.set_page_load_timeout(30)
             return True

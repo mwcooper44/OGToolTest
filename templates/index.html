@@ -161,9 +161,10 @@
             padding: 12px;
             border: 1px solid #e1e5e9;
             border-radius: 6px;
-            min-height: 150px;
+            height: 300px;
             overflow-y: auto;
             white-space: pre-wrap;
+            scroll-behavior: smooth;
         }
 
 
@@ -339,7 +340,8 @@
             upgrade: true,
             rememberUpgrade: true,
             timeout: 20000,
-            forceNew: false
+            forceNew: false,
+            autoConnect: true
         });
         
         // DOM elements
@@ -369,9 +371,19 @@
         returnHomeBtn.addEventListener('click', returnToHome);
 
         // Socket event listeners
-        socket.on('console_update', (data) => {
-            consoleOutput.textContent = data.lines.join('\n');
+        socket.on('log_message', (data) => {
+            console.log('Log message received:', data.data);
+            
+            // Append new message immediately
+            consoleOutput.textContent += data.data + '\n';
+            
+            // Auto-scroll to bottom immediately
             consoleOutput.scrollTop = consoleOutput.scrollHeight;
+        });
+
+        socket.on('scraping_started', (data) => {
+            console.log('Scraping started:', data);
+            showStatus(`🚀 Started scraping: ${data.url}`, 'success');
         });
 
         socket.on('scraping_complete', (data) => {
@@ -389,6 +401,13 @@
             showStatus(`❌ Error: ${data.error}`, 'error');
         });
 
+        socket.on('error', (data) => {
+            console.log('WebSocket error:', data);
+            showStatus(`❌ Error: ${data.message}`, 'error');
+            isScraping = false;
+            updateUI();
+        });
+
         socket.on('scraping_cancelled', (data) => {
             isScraping = false;
             updateUI();
@@ -401,11 +420,20 @@
         });
 
         socket.on('connect', () => {
-            console.log('Connected to server');
+            console.log('✅ Connected to server');
+            socket.emit('test', 'Hello from client');
         });
 
         socket.on('disconnect', () => {
-            console.log('Disconnected from server');
+            console.log('❌ Disconnected from server');
+        });
+
+        socket.on('connect_error', (error) => {
+            console.error('❌ Connection error:', error);
+        });
+
+        socket.on('test_response', (data) => {
+            console.log('✅ Test response received:', data.message);
         });
 
         socket.on('reconnect', () => {
@@ -432,28 +460,11 @@
             isScraping = true;
             updateUI();
             
-            fetch('/api/start_scraping', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({ url: url })
-            })
-            .then(response => response.json())
-            .then(data => {
-                if (data.error) {
-                    showStatus(data.error, 'error');
-                    isScraping = false;
-                    updateUI();
-                } else {
-                    showStatus(`🚀 Started scraping: ${data.url}`, 'success');
-                }
-            })
-            .catch(error => {
-                showStatus(`Error: ${error.message}`, 'error');
-                isScraping = false;
-                updateUI();
-            });
+            // Clear console output
+            consoleOutput.textContent = '';
+            
+            // Send WebSocket message to start scraping
+            socket.emit('start_scraping', { url: url });
         }
 
         function cancelScraping() {
@@ -502,6 +513,7 @@
             // Show success message
             showStatus('Ready for a new scraping session!', 'success');
         }
+
 
         function updateUI() {
             if (isScraping) {
