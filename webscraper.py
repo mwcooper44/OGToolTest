@@ -350,6 +350,7 @@ class WebScraper:
             '.blog-content', '.article-content', '.page-content'
         ]
         
+        content_element = None
         for selector in content_selectors:
             if selector.startswith('.'):
                 elements = soup.select(selector)
@@ -357,17 +358,34 @@ class WebScraper:
                 elements = soup.find_all(selector)
             
             if elements:
-                content = ' '.join([elem.get_text() for elem in elements])
+                # Get the first matching element
+                content_element = elements[0]
                 break
         
         # Fallback to body content
-        if not content:
-            body = soup.find('body')
-            if body:
-                content = body.get_text()
+        if not content_element:
+            content_element = soup.find('body')
+        
+        # Convert to markdown if we found content
+        if content_element:
+            # Create a clean copy for markdown conversion
+            clean_soup = BeautifulSoup(str(content_element), 'html.parser')
+            
+            # Configure html2text
+            h = html2text.HTML2Text()
+            h.ignore_links = False
+            h.ignore_images = False
+            h.ignore_emphasis = False
+            h.body_width = 0  # Don't wrap lines
+            h.unicode_snob = True
+            h.escape_snob = True
+            
+            # Convert to markdown
+            content = h.handle(str(clean_soup))
         
         # Clean up content
-        content = re.sub(r'\s+', ' ', content).strip()
+        content = re.sub(r'\n\s*\n', '\n\n', content)  # Normalize line breaks
+        content = content.strip()
         content = self.clean_comment_content(content)
         
         # Skip error pages
@@ -555,16 +573,44 @@ class WebScraper:
                     "article, main, .content, .post-content, .entry-content, .blog-content, .article-content, .page-content")
                 
                 if content_elements:
-                    content = ' '.join([elem.text for elem in content_elements])
+                    # Get HTML content for markdown conversion
+                    content_html = content_elements[0].get_attribute('outerHTML')
+                    # Convert to markdown
+                    h = html2text.HTML2Text()
+                    h.ignore_links = False
+                    h.ignore_images = False
+                    h.ignore_emphasis = False
+                    h.body_width = 0
+                    h.unicode_snob = True
+                    h.escape_snob = True
+                    content = h.handle(content_html)
                 else:
                     # Fallback to body
                     body = self.driver.find_element(By.TAG_NAME, "body")
-                    content = body.text
+                    body_html = body.get_attribute('outerHTML')
+                    h = html2text.HTML2Text()
+                    h.ignore_links = False
+                    h.ignore_images = False
+                    h.ignore_emphasis = False
+                    h.body_width = 0
+                    h.unicode_snob = True
+                    h.escape_snob = True
+                    content = h.handle(body_html)
             except:
-                content = self.driver.find_element(By.TAG_NAME, "body").text
+                body = self.driver.find_element(By.TAG_NAME, "body")
+                body_html = body.get_attribute('outerHTML')
+                h = html2text.HTML2Text()
+                h.ignore_links = False
+                h.ignore_images = False
+                h.ignore_emphasis = False
+                h.body_width = 0
+                h.unicode_snob = True
+                h.escape_snob = True
+                content = h.handle(body_html)
             
             # Clean up content
-            content = re.sub(r'\s+', ' ', content).strip()
+            content = re.sub(r'\n\s*\n', '\n\n', content)  # Normalize line breaks
+            content = content.strip()
             content = self.clean_comment_content(content)
             
             # Skip error pages
