@@ -122,10 +122,18 @@ def download_results():
     if not scraping_status['results_file'] or not os.path.exists(scraping_status['results_file']):
         return jsonify({'error': 'No results available for download'}), 404
     
+    # Extract domain from the current URL for download filename
+    current_url = scraping_status.get('current_url', '')
+    if current_url:
+        domain = current_url.replace('https://', '').replace('http://', '').split('/')[0]
+        download_name = f"{domain}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    else:
+        download_name = f"scraped_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    
     return send_file(
         scraping_status['results_file'],
         as_attachment=True,
-        download_name=f"scraped_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        download_name=download_name
     )
 
 def run_scraper(url):
