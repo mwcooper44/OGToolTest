@@ -41,9 +41,30 @@ class WebScraper:
         self.delay = delay
         self.visited_urls: Set[str] = set()
         self.scraped_items: List[ScrapedItem] = []
+        self.cancelled = False
         self.session = requests.Session()
+        # Rotate between different realistic User-Agents
+        self.user_agents = [
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0'
+        ]
+        self.current_ua_index = 0
+        
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            'User-Agent': self.user_agents[0],
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0',
         })
         self.driver = None
         self.request_count = 0
@@ -119,6 +140,11 @@ class WebScraper:
         if any(domain in url_lower for domain in social_domains):
             return True
         
+        # Filter out Vercel security checkpoint URLs
+        vercel_keywords = ['vercel', 'security-checkpoint', 'security_checkpoint', 'checkpoint']
+        if any(keyword in url_lower for keyword in vercel_keywords):
+            return True
+        
         # Filter out file downloads
         file_extensions = ['.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', 
                           '.zip', '.rar', '.tar', '.gz', '.mp3', '.mp4', '.avi', '.mov']
@@ -163,6 +189,17 @@ class WebScraper:
         self.last_request_time = time.time()
         self.request_count += 1
     
+    def rotate_user_agent(self):
+        """Rotate to the next User-Agent"""
+        self.current_ua_index = (self.current_ua_index + 1) % len(self.user_agents)
+        self.session.headers['User-Agent'] = self.user_agents[self.current_ua_index]
+        print(f"Rotated to User-Agent: {self.user_agents[self.current_ua_index][:50]}...")
+    
+    def check_cancellation(self):
+        """Check if scraping has been cancelled"""
+        # This will be set by the Flask app when cancellation is requested
+        return self.cancelled
+    
     def handle_rate_limit(self, url: str, retry_count: int = 0) -> bool:
         """Handle rate limiting with exponential backoff"""
         if retry_count >= 3:
@@ -190,11 +227,26 @@ class WebScraper:
             "Forbidden",
             "Page not found",
             "404 Not Found",
-            "This site requires JavaScript"
+            "Vercel Security Checkpoint",
+            "Security Checkpoint",
+            "vercel"
         ]
         
         content_lower = content.lower().strip()
-        return any(indicator.lower() in content_lower for indicator in error_indicators)
+        
+        # Check for error indicators
+        has_error = any(indicator.lower() in content_lower for indicator in error_indicators)
+        
+        # Special case: Don't flag pages that have "This site requires JavaScript" 
+        # if they also have substantial content (indicating they're working with Selenium)
+        if "This site requires JavaScript".lower() in content_lower:
+            # If the content is substantial (more than 1000 chars), it's likely working
+            if len(content.strip()) > 1000:
+                return False
+            # If it's just the JavaScript message with little other content, it's an error
+            return True
+        
+        return has_error
     
     def clean_comment_content(self, content: str) -> str:
         """Remove comment-related content from text"""
@@ -217,6 +269,10 @@ class WebScraper:
             r'Discussion\s*\(\d+\)',  # "Discussion (3)"
             r'Replies?\s*\(\d+\)',  # "Replies (2)"
             r'Thread\s*\(\d+\)',  # "Thread (1)"
+            r'Vercel Security Checkpoint',  # "Vercel Security Checkpoint"
+            r'Security Checkpoint',  # "Security Checkpoint"
+            r'vercel',  # "vercel"
+            r'checkpoint',  # "checkpoint"
         ]
         
         cleaned_content = content
@@ -410,6 +466,11 @@ class WebScraper:
         if not title:
             title = url.split('/')[-1].replace('-', ' ').title()
         
+        # Check if this is Vercel Security Checkpoint content
+        if self.is_error_page(content) or 'vercel' in title.lower() or 'security checkpoint' in title.lower():
+            print(f"Filtering out Vercel Security Checkpoint content: {title}")
+            return None
+        
         content_type = self.classify_content_type(title, content, url)
         
         return ScrapedItem(
@@ -510,12 +571,16 @@ class WebScraper:
                                 break
                     
                     if len(content) > 50:
-                        blog_posts.append(ScrapedItem(
-                            title=title,
-                            content=content,
-                            content_type="blog",
-                            source_url=url
-                        ))
+                        # Check if this is Vercel Security Checkpoint content
+                        if not (self.is_error_page(content) or 'vercel' in title.lower() or 'security checkpoint' in title.lower()):
+                            blog_posts.append(ScrapedItem(
+                                title=title,
+                                content=content,
+                                content_type="blog",
+                                source_url=url
+                            ))
+                        else:
+                            print(f"Filtering out Vercel Security Checkpoint blog post: {title}")
         return blog_posts[:8]  # Limit to 8 blog posts
     
     def extract_content_with_selenium(self, url: str) -> Optional[ScrapedItem]:
@@ -624,6 +689,11 @@ class WebScraper:
             if not title:
                 title = url.split('/')[-1].replace('-', ' ').title()
             
+            # Check if this is Vercel Security Checkpoint content
+            if self.is_error_page(content) or 'vercel' in title.lower() or 'security checkpoint' in title.lower():
+                print(f"Filtering out Vercel Security Checkpoint content: {title}")
+                return None
+            
             content_type = self.classify_content_type(title, content, url)
             
             return ScrapedItem(
@@ -702,8 +772,48 @@ class WebScraper:
                 else:
                     return [], []
             elif response.status_code == 403:  # Forbidden
-                print(f"Access forbidden for {url} (403), skipping...")
-                return [], []
+                print(f"Access forbidden for {url} (403), trying with different approach...")
+                # Try with Selenium first (more likely to bypass protection)
+                try:
+                    print(f"Attempting to access {url} with Selenium...")
+                    result, links = self.scrape_page_with_selenium(url)
+                    if result:
+                        print(f"Successfully accessed {url} with Selenium")
+                        return result, links
+                except Exception as selenium_e:
+                    print(f"Selenium failed for {url}: {selenium_e}")
+                
+                # If Selenium fails, try rotating User-Agent
+                try:
+                    self.rotate_user_agent()
+                    retry_response = requests.get(url, headers=self.session.headers, timeout=10)
+                    if retry_response.status_code == 200:
+                        print(f"Successfully accessed {url} with rotated User-Agent")
+                        result = self.extract_content_from_html(retry_response.text, url)
+                        links = self.extract_links_from_html(retry_response.text, url)
+                        if isinstance(result, list):
+                            return result, links
+                        elif result and len(result.content) > 50:
+                            return [result], links
+                    else:
+                        print(f"Still blocked for {url} (403), trying one more User-Agent...")
+                        # Try one more User-Agent
+                        self.rotate_user_agent()
+                        retry_response2 = requests.get(url, headers=self.session.headers, timeout=10)
+                        if retry_response2.status_code == 200:
+                            print(f"Successfully accessed {url} with second rotated User-Agent")
+                            result = self.extract_content_from_html(retry_response2.text, url)
+                            links = self.extract_links_from_html(retry_response2.text, url)
+                            if isinstance(result, list):
+                                return result, links
+                            elif result and len(result.content) > 50:
+                                return [result], links
+                        else:
+                            print(f"Still blocked for {url} (403), skipping...")
+                            return [], []
+                except Exception as retry_e:
+                    print(f"Retry failed for {url}: {retry_e}")
+                    return [], []
             elif response.status_code >= 400:
                 print(f"HTTP error {response.status_code} for {url}, skipping...")
                 return [], []
@@ -758,6 +868,28 @@ class WebScraper:
         
         return [], []
     
+    def scrape_page_with_selenium(self, url: str) -> Tuple[List[ScrapedItem], List[str]]:
+        """Scrape a single page using Selenium and return content + discovered links"""
+        print(f"Scraping with Selenium: {url}")
+        
+        if not self.driver:
+            self.setup_selenium()
+        
+        if not self.driver:
+            print("Selenium driver not available")
+            return [], []
+        
+        try:
+            self.smart_delay()
+            item = self.extract_content_with_selenium(url)
+            links = self.extract_links_with_selenium(url)
+            if item:
+                return [item], links
+        except Exception as e:
+            print(f"Selenium scraping failed for {url}: {e}")
+        
+        return [], []
+    
     def scrape_website(self) -> Dict:
         """Main method to scrape the entire website"""
         print(f"Starting to scrape: {self.base_url}")
@@ -765,6 +897,11 @@ class WebScraper:
         urls_to_visit = [self.base_url]
         
         while urls_to_visit and len(self.scraped_items) < self.max_pages:
+            # Check for cancellation
+            if self.check_cancellation():
+                print("🛑 Scraping cancelled by user")
+                break
+                
             current_url = urls_to_visit.pop(0)
             
             if current_url in self.visited_urls:
