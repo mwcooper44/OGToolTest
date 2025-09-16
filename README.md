@@ -1,6 +1,6 @@
 # Web Scraper
 
-A powerful web scraper that can handle both static HTML and JavaScript-heavy websites. Features a web interface for easy use and real-time progress updates.
+Web scraper to be used in my consulting club project this semester. (AI Marketing tool)
 
 ## Quick Start
 
